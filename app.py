@@ -1,4 +1,13 @@
-import os, time, json, tempfile, requests, streamlit as st
+# app.py
+# Agent CI files: list with per-file delete, upload + overwrite by filename (preserve original name),
+# "New thread" button, larger Ask box, and show only current run responses.
+
+import os
+import time
+import json
+import tempfile
+import requests
+import streamlit as st
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -10,7 +19,7 @@ def read_setting(key: str, required: bool = True, default: str = "") -> str:
         st.stop()
     return val
 
-PROJECT_ENDPOINT = read_setting("PROJECT_ENDPOINT").rstrip("/")
+PROJECT_ENDPOINT = read_setting("PROJECT_ENDPOINT").rstrip("/")   # https://.../api/projects/<project>
 ORCHESTRATOR_AGENT_ID = read_setting("ORCHESTRATOR_AGENT_ID")
 
 # Auth and SDK clients
@@ -41,9 +50,11 @@ def get_bearer_token_for_foundry() -> str:
 
 @st.cache_data(ttl=60)
 def fetch_agents_list_rest():
+    # List Agents (project scoped)
     url = f"{PROJECT_ENDPOINT}/assistants?api-version=v1"
     headers = {"Authorization": f"Bearer {get_bearer_token_for_foundry()}"}
-    resp = requests.get(url, headers=headers, timeout=60); resp.raise_for_status()
+    resp = requests.get(url, headers=headers, timeout=60)
+    resp.raise_for_status()
     data = resp.json().get("data", [])
     items = []
     for a in data:
@@ -56,13 +67,16 @@ def fetch_agents_list_rest():
 def get_agent(agent_id: str) -> dict:
     url = f"{PROJECT_ENDPOINT}/assistants/{agent_id}?api-version=v1"
     headers = {"Authorization": f"Bearer {get_bearer_token_for_foundry()}"}
-    resp = requests.get(url, headers=headers, timeout=60); resp.raise_for_status()
+    resp = requests.get(url, headers=headers, timeout=60)
+    resp.raise_for_status()
     return resp.json()
 
 def files_get_rest(file_id: str) -> dict:
+    # Resolve filename/size for display
     url = f"{PROJECT_ENDPOINT}/files/{file_id}?api-version=v1"
     headers = {"Authorization": f"Bearer {get_bearer_token_for_foundry()}"}
-    resp = requests.get(url, headers=headers, timeout=60); resp.raise_for_status()
+    resp = requests.get(url, headers=headers, timeout=60)
+    resp.raise_for_status()
     return resp.json()
 
 def list_agent_ci_files(agent_id: str):
@@ -78,6 +92,7 @@ def list_agent_ci_files(agent_id: str):
     return rows
 
 def set_agent_ci_file_ids(agent_id: str, file_ids: list):
+    # Ensure CI tool remains present while updating tool_resources
     agent = get_agent(agent_id)
     tools = agent.get("tools", []) or []
     if not any((t.get("type") == "code_interpreter") for t in tools):
@@ -85,7 +100,8 @@ def set_agent_ci_file_ids(agent_id: str, file_ids: list):
     body = {"tools": tools, "tool_resources": {"code_interpreter": {"file_ids": file_ids}}}
     url = f"{PROJECT_ENDPOINT}/assistants/{agent_id}?api-version=v1"
     headers = {"Authorization": f"Bearer {get_bearer_token_for_foundry()}", "Content-Type": "application/json"}
-    resp = requests.post(url, headers=headers, data=json.dumps(body), timeout=60); resp.raise_for_status()
+    resp = requests.post(url, headers=headers, data=json.dumps(body), timeout=60)
+    resp.raise_for_status()
     return resp.json()
 
 st.title("AI Foundry Orchestrated Multi‑Agent with File upload")
@@ -101,20 +117,21 @@ with st.sidebar:
         st.stop()
 
     if not st.session_state["agent_list"]:
-        st.error("No agents found in this project."); st.stop()
+        st.error("No agents found in this project.")
+        st.stop()
 
     display_names = [n for n, _ in st.session_state["agent_list"]]
     chosen = st.selectbox("Target agent", display_names, index=0)
     chosen_agent_id = dict(st.session_state["agent_list"])[chosen]
 
-    # New thread button (explicit thread reset)
+    # New thread button
     if st.button("New thread"):
         thread = agents.threads.create()
         st.session_state["thread_id"] = thread.id
         st.session_state["logs"] = []
         st.success(f"Started a new thread: {thread.id}")
 
-    # Render existing CI files with inline Delete
+    # Existing CI files with inline Delete
     st.subheader("Files in Code Interpreter")
     try:
         ci_files = list_agent_ci_files(chosen_agent_id)
@@ -127,9 +144,9 @@ with st.sidebar:
                     if st.button("Delete", key=f"del_{f['file_id']}"):
                         try:
                             remaining = [x["file_id"] for x in ci_files if x["file_id"] != f["file_id"]]
-                            set_agent_ci_file_ids(chosen_agent_id, remaining)
+                            set_agent_ci_file_ids(chosen_agent_id, remaining)  # remove from tool_resources
                             try:
-                                agents.files.delete(file_id=f["file_id"])
+                                agents.files.delete(file_id=f["file_id"])  # remove file object
                             except Exception:
                                 pass
                             st.success(f"Deleted {f['filename']} from CI and project.")
@@ -141,22 +158,30 @@ with st.sidebar:
     except Exception as e:
         st.warning(f"Could not list CI files: {e}")
 
-# Upload and overwrite-by-filename
+# Upload and overwrite-by-filename (preserve original filename; no temp suffix)
 uploaded = st.file_uploader("Upload a file to attach/persist in Code Interpreter", type=["xlsx","xlsm","xls","csv","pdf","png","jpg","jpeg"])
 
 if uploaded and st.button("Upload and persist (overwrite by filename)"):
+    # Write bytes to a temp directory with the original name, then upload by file_path + filename
     data = uploaded.getvalue()
     with st.spinner("Uploading to Foundry Files…"):
-        with tempfile.NamedTemporaryFile(delete=False, suffix=f"_{uploaded.name}") as tf:
-            tf.write(data); tmp_path = tf.name
+        tmpdir = tempfile.mkdtemp()
+        tmp_path = os.path.join(tmpdir, uploaded.name)  # exact original name; no random suffix
+        with open(tmp_path, "wb") as f:
+            f.write(data)
         try:
-            new_file = agents.files.upload(file_path=tmp_path, purpose="assistants")
+            # Preserve stored name using filename kw per FilesOperations.upload
+            new_file = agents.files.upload(file_path=tmp_path, purpose="assistants", filename=uploaded.name)  # API supports filename kw
             st.session_state["file_id"] = new_file.id
             log(f"Uploaded new file_id={new_file.id} for '{uploaded.name}'.")
         finally:
-            try: os.remove(tmp_path)
-            except Exception: pass
+            try:
+                os.remove(tmp_path)
+                os.rmdir(tmpdir)
+            except Exception:
+                pass
 
+    # Persist in CI, overwriting by filename if needed
     try:
         ci_files = list_agent_ci_files(chosen_agent_id)
         existing_ids = [e["file_id"] for e in ci_files]
@@ -182,18 +207,21 @@ if uploaded and st.button("Upload and persist (overwrite by filename)"):
     except Exception as e:
         st.error(f"Persist/overwrite failed: {e}")
 
-# Larger Ask box using text_area (height=180)
+# Larger Ask box
 question = st.text_area("Ask the orchestrator", height=180, placeholder="Type a detailed question or instructions...")
 
-# Run: render only the latest run’s assistant output
+# Run: render only current run’s assistant output (history remains in thread)
 if st.button("Run"):
+    # Create/reuse thread (history persists for context)
     if st.session_state["thread_id"] is None:
-        thread = agents.threads.create(); st.session_state["thread_id"] = thread.id
+        thread = agents.threads.create()
+        st.session_state["thread_id"] = thread.id
         log(f"Thread created: {thread.id}.")
     else:
         class _T: pass
         thread = _T(); thread.id = st.session_state["thread_id"]
 
+    # Attach last uploaded file so CI can read it this run
     attachments = []
     if st.session_state.get("file_id"):
         ci_tool = CodeInterpreterTool()
@@ -206,11 +234,13 @@ if st.button("Run"):
     with st.spinner("Running orchestrator…"):
         run = agents.runs.create(thread_id=thread.id, agent_id=ORCHESTRATOR_AGENT_ID)
         status = run.status
-        while status in ("queued","in_progress","requires_action"):
+        while status in ("queued", "in_progress", "requires_action"):
             time.sleep(2)
-            run = agents.runs.get(thread_id=thread.id, run_id=run.id); status = run.status
+            run = agents.runs.get(thread_id=thread.id, run_id=run.id)
+            status = run.status
         st.info(f"Run status: {status}")
 
+    # Show only current run’s assistant messages
     pager = agents.messages.list(thread_id=thread.id, run_id=run.id, order="asc", limit=100)
     chunks = []
     for m in pager:
@@ -223,6 +253,8 @@ if st.button("Run"):
     if chunks:
         st.markdown("**Assistant:**")
         st.write("\n\n".join(chunks))
+    else:
+        st.warning("No assistant response generated.")
 
 # Show logs
 if st.session_state["logs"]:
