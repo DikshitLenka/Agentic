@@ -1,0 +1,359 @@
+import os, time, json, tempfile, requests, streamlit as st
+from dotenv import load_dotenv
+from azure.ai.projects import AIProjectClient
+from azure.ai.agents import AgentsClient
+from azure.ai.agents.models import ConnectedAgentTool, CodeInterpreterTool, MessageAttachment
+from azure.identity import DefaultAzureCredential
+
+
+
+load_dotenv()
+
+def read_setting(key: str, required: bool = True, default: str = "") -> str:
+    val = os.getenv(key, default).strip().strip('"').strip("'")
+    if required and not val:
+        st.error(f"Missing setting: {key}. Add it to .env or environment variables.")
+        st.stop()
+    return val
+
+PROJECT_ENDPOINT = read_setting("PROJECT_ENDPOINT").rstrip("/")
+MODEL_DEPLOYMENT_NAME = read_setting("MODEL_DEPLOYMENT_NAME")
+AUTO_DEDUP = os.getenv("AUTO_DEDUP", "false").lower() == "true"
+
+credential = DefaultAzureCredential(exclude_interactive_browser_credential=False)
+
+project_client = AIProjectClient(endpoint=PROJECT_ENDPOINT, credential=credential)
+agents = AgentsClient(endpoint=PROJECT_ENDPOINT, credential=credential)
+
+# Session defaults
+st.session_state.setdefault("thread_id", None)
+st.session_state.setdefault("file_id", None)
+st.session_state.setdefault("agent_list", [])
+st.session_state.setdefault("logs", [])
+st.session_state.setdefault("ids", {"content_extractor": None, "validator": None, "orchestrator": None})
+st.session_state.setdefault("ci_refresh_token", 0.0)
+st.session_state.setdefault("last_uploaded_filename", None)
+st.session_state.setdefault("last_upload_completed", False)
+
+def log(msg: str): st.session_state["logs"].append(msg)
+
+def bearer() -> str:
+    return credential.get_token("https://ai.azure.com/.default").token  # Foundry project scope
+
+# ----- Agent list helpers (REST, paginated up to 100) -----
+def list_agents_raw(max_per_page: int = 100):
+    per_page = max(1, min(max_per_page, 100))
+    endpoint = f"{PROJECT_ENDPOINT}/assistants"
+    headers = {"Authorization": f"Bearer {bearer()}"}
+    params = {"api-version": "v1", "limit": per_page, "order": "asc"}
+    all_items, after = [], None
+    while True:
+        q = dict(params)
+        if after: q["after"] = after
+        r = requests.get(endpoint, headers=headers, params=q, timeout=60)
+        r.raise_for_status()
+        body = r.json()
+        items = body.get("data", []) or []
+        all_items.extend(items)
+        if not body.get("has_more") or not body.get("last_id"):
+            break
+        after = body["last_id"]
+    return all_items
+
+def map_by_name_lower(items):
+    by = {}
+    for a in items:
+        nm = (a.get("name") or "").strip()
+        if not nm: continue
+        by.setdefault(nm.lower(), []).append(a)
+    return by
+
+def pick_primary(entries):
+    return sorted(entries, key=lambda x: x.get("created_at", 0))[0]  # keep oldest
+
+# ----- Files and agent metadata (REST) -----
+def files_get_rest(file_id: str) -> dict:
+    url = f"{PROJECT_ENDPOINT}/files/{file_id}?api-version=v1"
+    headers = {"Authorization": f"Bearer {bearer()}"}
+    resp = requests.get(url, headers=headers, timeout=60)
+    resp.raise_for_status()
+    return resp.json()
+
+def get_agent_meta(agent_id: str) -> dict:
+    url = f"{PROJECT_ENDPOINT}/assistants/{agent_id}?api-version=v1"
+    headers = {"Authorization": f"Bearer {bearer()}"}
+    resp = requests.get(url, headers=headers, timeout=60)
+    resp.raise_for_status()
+    return resp.json()
+
+# ----- Idempotent ensure of the 3 agents (with Code Interpreter enabled) -----
+def ensure_single_agent(name: str, description: str, instructions: str):
+    existing = list_agents_raw()
+    by_name = map_by_name_lower(existing)
+    nm_l = name.lower()
+    dups = []
+    ci_tool = CodeInterpreterTool()
+    if nm_l in by_name and by_name[nm_l]:
+        primary = pick_primary(by_name[nm_l])
+        agent_id = primary["id"]
+        project_client.agents.update_agent(
+            agent_id=agent_id,
+            model=MODEL_DEPLOYMENT_NAME,
+            name=name,
+            description=description,
+            instructions=instructions,
+            tools=ci_tool.definitions,
+        )
+        dups = [e["id"] for e in by_name[nm_l] if e["id"] != agent_id]
+        return agent_id, dups
+    created = project_client.agents.create_agent(
+        model=MODEL_DEPLOYMENT_NAME,
+        name=name,
+        description=description,
+        instructions=instructions,
+        tools=ci_tool.definitions,
+    )
+    return created.id, []
+
+def ensure_connected_orchestrator(orchestrator_id: str, extractor_id: str, validator_id: str):
+    ci_tool = CodeInterpreterTool()
+    extraction_tool = ConnectedAgentTool(
+        id=extractor_id,
+        name="content_extractor",
+        description="Use to analyze the uploaded file and extract only from that file based on the user query.",
+    )
+    validation_tool = ConnectedAgentTool(
+        id=validator_id,
+        name="validator",
+        description="Use to validate the extracted data strictly against rules using the uploaded file as ground truth.",
+    )
+    tools_payload = ci_tool.definitions + extraction_tool.definitions + validation_tool.definitions
+    project_client.agents.update_agent(agent_id=orchestrator_id, tools=tools_payload)
+
+def delete_agent(agent_id: str):
+    try:
+        project_client.agents.delete_agent(agent_id)
+    except Exception:
+        pass
+
+def ensure_all_agents_idempotent(auto_dedup: bool = False):
+    with project_client:
+        ext_id, ext_dups = ensure_single_agent(
+            name="content_extractor",
+            description="Auditor-style extractor that reads only the uploaded file and returns structured results.",
+            instructions=("ALWAYS answer by reading the file attached to Code Interpreter; do not use prior memory or outside knowledge. "
+                          "Iterate sheetwise for spreadsheets; return only file-grounded findings.")
+        )
+        val_id, val_dups = ensure_single_agent(
+            name="validator",
+            description="Validation specialist that uses only the uploaded file and explicit rules.",
+            instructions=("Validate only what is present in the uploaded file. "
+                          "Report violations with reasons and a final pass/fail; do not fabricate data not present in the file.")
+        )
+        orch_id, orch_dups = ensure_single_agent(
+            name="orchestrator",
+            description="Routes tasks to extractor/validator and summarizes file-grounded results.",
+            instructions=("Always use the file attached to Code Interpreter as the single source of truth. "
+                          "If extraction is needed, first call 'content_extractor', then forward its outputs to 'validator' if validation is requested. "
+                          "Do not answer from memory; ensure all statements are grounded in the attached file.")
+        )
+        ensure_connected_orchestrator(orch_id, ext_id, val_id)
+        if auto_dedup:
+            for dup in set(ext_dups + val_dups + orch_dups): delete_agent(dup)
+        return {"content_extractor": ext_id, "validator": val_id, "orchestrator": orch_id}
+
+def sync_ci_files_to_subagents(orchestrator_id: str, sub_agent_ids: list[str]):
+    meta = get_agent_meta(orchestrator_id)
+    file_ids = meta.get("tool_resources", {}).get("code_interpreter", {}).get("file_ids", []) or []
+    if not file_ids:
+        return
+    headers = {"Authorization": f"Bearer {bearer()}", "Content-Type": "application/json"}
+    for sid in sub_agent_ids:
+        smeta = get_agent_meta(sid)
+        tools = smeta.get("tools", []) or []
+        if not any(t.get("type") == "code_interpreter" for t in tools):
+            tools.append({"type": "code_interpreter"})
+        body = {"tools": tools, "tool_resources": {"code_interpreter": {"file_ids": file_ids}}}
+        url = f"{PROJECT_ENDPOINT}/assistants/{sid}?api-version=v1"
+        r = requests.post(url, headers=headers, data=json.dumps(body), timeout=60)
+        r.raise_for_status()
+
+# ---- UI ----
+st.title("AI Foundry Orchestrated Multi‑Agent (File‑Grounded)")
+
+with st.sidebar:
+    st.header("Agent Controls")
+    if st.button("Ensure/Repair agents now"):
+        st.session_state["ids"] = ensure_all_agents_idempotent(auto_dedup=AUTO_DEDUP)
+        st.success(f"Ready. Orchestrator={st.session_state['ids']['orchestrator']}")
+
+    # New thread button (creates a fresh thread and resets run-local state)
+    if st.button("New thread"):
+        thread = agents.threads.create()
+        st.session_state["thread_id"] = thread.id
+        st.session_state["logs"] = []
+        st.success(f"Started a new thread: {thread.id}")  # threads persist conversation context per agent design
+
+    if st.button("Auto de‑duplicate by name"):
+        st.session_state["ids"] = ensure_all_agents_idempotent(auto_dedup=True)
+        st.success("Duplicates removed (kept oldest per name).")
+
+# Auto ensure once per session
+if not st.session_state["ids"]["orchestrator"]:
+    st.session_state["ids"] = ensure_all_agents_idempotent(auto_dedup=AUTO_DEDUP)
+
+# ---- Files in Code Interpreter (with Refresh) ----
+def list_agent_ci_files(agent_id: str, _refresh_token: float = 0.0):
+    meta = get_agent_meta(agent_id)
+    file_ids = meta.get("tool_resources", {}).get("code_interpreter", {}).get("file_ids", []) or []
+    rows = []
+    for fid in file_ids:
+        try:
+            m = files_get_rest(fid)
+            rows.append({"file_id": fid, "filename": m.get("filename", ""), "bytes": m.get("bytes")})
+        except Exception:
+            rows.append({"file_id": fid, "filename": "(unavailable)", "bytes": None})
+    return rows
+
+with st.sidebar:
+    st.subheader("Files in Code Interpreter")
+    if st.button("Refresh CI files"):
+        st.session_state["ci_refresh_token"] = time.time()
+        st.rerun()
+    try:
+        ci_files = list_agent_ci_files(st.session_state["ids"]["orchestrator"], _refresh_token=st.session_state["ci_refresh_token"])
+        if ci_files:
+            for f in ci_files:
+                c1, c2 = st.columns([0.75, 0.25])
+                with c1: st.write(f"- {f['filename']} (id={f['file_id']}, bytes={f['bytes']})")
+                with c2:
+                    if st.button("Delete", key=f"del_{f['file_id']}"):
+                        meta = get_agent_meta(st.session_state["ids"]["orchestrator"])
+                        ids_now = meta.get("tool_resources", {}).get("code_interpreter", {}).get("file_ids", []) or []
+                        remaining = [x for x in ids_now if x != f["file_id"]]
+                        tools = meta.get("tools", []) or []
+                        if not any(t.get("type") == "code_interpreter" for t in tools):
+                            tools.append({"type": "code_interpreter"})
+                        body = {"tools": tools, "tool_resources": {"code_interpreter": {"file_ids": remaining}}}
+                        url = f"{PROJECT_ENDPOINT}/assistants/{st.session_state['ids']['orchestrator']}?api-version=v1"
+                        headers = {"Authorization": f"Bearer {bearer()}", "Content-Type": "application/json"}
+                        r = requests.post(url, headers=headers, data=json.dumps(body), timeout=60)
+                        r.raise_for_status()
+                        try: agents.files.delete(file_id=f["file_id"])
+                        except Exception: pass
+                        st.success(f"Deleted {f['filename']}."); st.session_state["ci_refresh_token"] = time.time(); st.rerun()
+        else:
+            st.info("No files attached to Code Interpreter for this agent.")
+    except Exception as e:
+        st.warning(f"Could not list CI files: {e}")
+
+# ---- Upload/persist with button disable until a different file is chosen ----
+uploaded = st.file_uploader(
+    "Upload file for Code Interpreter",
+    type=["xlsx","xlsm","xls","csv","pdf","png","jpg","jpeg"],
+    key="ci_uploader",
+)
+
+if uploaded is not None and uploaded.name != st.session_state.get("last_uploaded_filename"):
+    st.session_state["last_upload_completed"] = False
+
+upload_button_disabled = (
+    uploaded is None
+    or (st.session_state.get("last_upload_completed") and uploaded.name == st.session_state.get("last_uploaded_filename"))
+)
+if st.button("Upload and persist (overwrite by filename)", disabled=upload_button_disabled):
+    if uploaded is None:
+        st.warning("Select a file first.")
+    else:
+        data = uploaded.getvalue()
+        with st.spinner("Uploading…"):
+            tmpdir = tempfile.mkdtemp()
+            tmp_path = os.path.join(tmpdir, uploaded.name)
+            with open(tmp_path, "wb") as f: f.write(data)
+            try:
+                new_file = agents.files.upload(file_path=tmp_path, purpose="assistants", filename=uploaded.name)
+                st.session_state["file_id"] = new_file.id
+            finally:
+                try: os.remove(tmp_path); os.rmdir(tmpdir)
+                except Exception: pass
+        try:
+            meta = get_agent_meta(st.session_state["ids"]["orchestrator"])
+            existing_ids = meta.get("tool_resources", {}).get("code_interpreter", {}).get("file_ids", []) or []
+            by_name = {}
+            for fid in existing_ids:
+                try:
+                    m = files_get_rest(fid); by_name[(m.get("filename") or "").lower()] = fid
+                except Exception:
+                    pass
+            if uploaded.name.lower() in by_name:
+                old_id = by_name[uploaded.name.lower()]
+                new_ids = [st.session_state["file_id"] if fid == old_id else fid for fid in existing_ids]
+            else:
+                new_ids = existing_ids + [st.session_state["file_id"]]
+            tools = meta.get("tools", []) or []
+            if not any(t.get("type") == "code_interpreter" for t in tools):
+                tools.append({"type": "code_interpreter"})
+            body = {"tools": tools, "tool_resources": {"code_interpreter": {"file_ids": new_ids}}}
+            url = f"{PROJECT_ENDPOINT}/assistants/{st.session_state['ids']['orchestrator']}?api-version=v1"
+            headers = {"Authorization": f"Bearer {bearer()}", "Content-Type": "application/json"}
+            r = requests.post(url, headers=headers, data=json.dumps(body), timeout=60)
+            r.raise_for_status()
+            if uploaded.name.lower() in by_name:
+                try: agents.files.delete(file_id=by_name[uploaded.name.lower()])
+                except Exception: pass
+            st.session_state["last_upload_completed"] = True
+            st.session_state["last_uploaded_filename"] = uploaded.name
+            st.success(f"File '{uploaded.name}' attached/updated in Code Interpreter.")
+            st.session_state["ci_refresh_token"] = time.time()
+            st.rerun()
+        except Exception as e:
+            st.error(f"Persist/overwrite failed: {e}")
+
+# ---- Ask + Run orchestrator (sync CI files to sub-agents before running) ----
+question = st.text_area("Ask the orchestrator", height=180, placeholder="Type a detailed question or instructions...")
+
+if st.button("Run"):
+    if st.session_state["thread_id"] is None:
+        thread = agents.threads.create(); st.session_state["thread_id"] = thread.id  # create a new thread when missing
+    else:
+        class _T: pass
+        thread = _T(); thread.id = st.session_state["thread_id"]
+
+    attachments = []
+    if st.session_state.get("file_id"):
+        ci_tool = CodeInterpreterTool()
+        attachments = [MessageAttachment(file_id=st.session_state["file_id"], tools=ci_tool.definitions)]
+
+    agents.messages.create(thread_id=thread.id, role="user", content=question or "Please analyze the uploaded file.", attachments=attachments)
+
+    try:
+        ids = st.session_state["ids"]
+        sync_ci_files_to_subagents(ids["orchestrator"], [ids["content_extractor"], ids["validator"]])
+    except Exception as e:
+        st.warning(f"Could not sync CI files to connected agents: {e}")
+
+    with st.spinner("Running orchestrator…"):
+        run = agents.runs.create(thread_id=thread.id, agent_id=st.session_state["ids"]["orchestrator"])
+        while run.status in ("queued", "in_progress", "requires_action"):
+            time.sleep(2); run = agents.runs.get(thread_id=thread.id, run_id=run.id)
+        st.info(f"Run status: {run.status}")
+
+    pager = agents.messages.list(thread_id=thread.id, run_id=run.id, order="asc", limit=100)
+    chunks = []
+    for m in pager:
+        if m.role != "assistant": continue
+        if getattr(m, "text_messages", None):
+            for tmc in m.text_messages:
+                if getattr(tmc, "text", None) and getattr(tmc.text, "value", None):
+                    chunks.append(tmc.text.value)
+    if chunks:
+        st.markdown("**Assistant:**"); st.write("\n\n".join(chunks))
+    else:
+        st.warning("No assistant response generated.")
+
+# ---- Logs ----
+if st.session_state["logs"]:
+    with st.expander("Logs"):
+        for l in st.session_state["logs"]:
+            st.write(f"- {l}")
+
