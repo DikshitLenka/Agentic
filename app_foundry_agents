@@ -239,9 +239,23 @@ with st.sidebar:
                         headers = {"Authorization": f"Bearer {bearer()}", "Content-Type": "application/json"}
                         r = requests.post(url, headers=headers, data=json.dumps(body), timeout=60)
                         r.raise_for_status()
-                        try: agents.files.delete(file_id=f["file_id"])
-                        except Exception: pass
-                        st.success(f"Deleted {f['filename']}."); st.session_state["ci_refresh_token"] = time.time(); st.rerun()
+                        try:
+                            ids = st.session_state["ids"]
+                            sync_ci_files_to_subagents(
+                                ids["orchestrator"],
+                                [ids["content_extractor"], ids["validator"]],
+                            )
+                        except Exception as e:
+                            st.warning(f"Could not sync CI files to connected agents after delete: {e}")
+
+                        # (existing optional deletion of the file object)
+                        try:
+                            agents.files.delete(file_id=f["file_id"])
+                        except Exception:
+                            pass
+                        st.success(f"Deleted {f['filename']}.");
+                        st.session_state["ci_refresh_token"] = time.time();
+                        st.rerun()
         else:
             st.info("No files attached to Code Interpreter for this agent.")
     except Exception as e:
@@ -298,6 +312,22 @@ if st.button("Upload and persist (overwrite by filename)", disabled=upload_butto
             headers = {"Authorization": f"Bearer {bearer()}", "Content-Type": "application/json"}
             r = requests.post(url, headers=headers, data=json.dumps(body), timeout=60)
             r.raise_for_status()
+            # NEW: mirror orchestrator CI file_ids to connected agents after upload
+            try:
+                ids = st.session_state["ids"]
+                sync_ci_files_to_subagents(
+                    ids["orchestrator"],
+                    [ids["content_extractor"], ids["validator"]],
+                )
+            except Exception as e:
+                st.warning(f"Could not sync CI files to connected agents after upload: {e}")
+
+            # (existing optional cleanup of old file object)
+            if uploaded.name.lower() in by_name:
+                try:
+                    agents.files.delete(file_id=by_name[uploaded.name.lower()])
+                except Exception:
+                    pass
             if uploaded.name.lower() in by_name:
                 try: agents.files.delete(file_id=by_name[uploaded.name.lower()])
                 except Exception: pass
