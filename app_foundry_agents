@@ -179,7 +179,7 @@ def sync_ci_files_to_subagents(orchestrator_id: str, sub_agent_ids: list[str]):
         r.raise_for_status()
 
 # ---- UI ----
-st.title("AI Foundry Orchestrated Multi‑Agent (File‑Grounded)")
+st.title("AI Foundry Orchestrated Multi‑Agentwith File upload")
 
 with st.sidebar:
     st.header("Agent Controls")
